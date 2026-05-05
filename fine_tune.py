@@ -2,6 +2,7 @@ import os
 import argparse
 import datetime
 import math
+import csv
 
 import torch
 import pytorch_lightning as pl
@@ -57,6 +58,11 @@ class Model(pl.LightningModule):
         self.test_preds = []
         self.test_targets = []
         self.rul_label_shape = None
+        self.test_preds_rows = []
+        self.test_targets_rows = []
+        self.val_preds_epoch = []
+        self.val_targets_epoch = []
+        self.val_rmse_per_var_history = []
 
     def forward(self, x):
         return self.model(x)
@@ -141,6 +147,9 @@ class Model(pl.LightningModule):
             self.log_dict({f"val_{k}": v for k, v in self.val_metrics.compute().items()},
                         on_epoch=True, prog_bar=True)
             self.log("val_loss", loss, on_epoch=True, prog_bar=True)
+            if self.args.task_type == "RUL":
+                self.val_preds_epoch.append(preds.detach().cpu().numpy())
+                self.val_targets_epoch.append(y.detach().cpu().numpy())
 
         elif stage == "test":
             if self.args.task_type == "FD":
@@ -156,8 +165,11 @@ class Model(pl.LightningModule):
                 self.test_rmse.update(preds, y)
                 self.test_preds.extend(preds.detach().cpu().reshape(-1).numpy())
                 self.test_targets.extend(y.detach().cpu().reshape(-1).numpy())
-                score = scoring_function_v2(np.array(self.test_preds), np.array(self.test_targets))
-                self.log("test_score", score)
+                self.test_preds_rows.append(preds.detach().cpu().numpy())
+                self.test_targets_rows.append(y.detach().cpu().numpy())
+                if self.args.rul_target_mode_effective == "single":
+                    score = scoring_function_v2(np.array(self.test_preds), np.array(self.test_targets))
+                    self.log("test_score", score)
 
             self.log("test_loss", loss)
 
@@ -176,6 +188,17 @@ class Model(pl.LightningModule):
         self.train_metrics.reset()
 
     def on_validation_epoch_end(self):
+        if self.args.task_type == "RUL":
+            if len(self.val_preds_epoch) > 0:
+                preds_2d = np.concatenate(self.val_preds_epoch, axis=0)
+                targets_2d = np.concatenate(self.val_targets_epoch, axis=0)
+                per_var_rmse = self._compute_per_variable_rmse(preds_2d, targets_2d)
+                self.val_rmse_per_var_history.append(per_var_rmse)
+                for i, rmse_val in enumerate(per_var_rmse):
+                    self.log(f"val_rmse_var{i}", float(rmse_val), on_epoch=True, prog_bar=False)
+
+            self.val_preds_epoch = []
+            self.val_targets_epoch = []
         self.val_metrics.reset()
 
     def on_test_epoch_end(self):
@@ -229,6 +252,13 @@ class Model(pl.LightningModule):
             # Save flattened predictions and targets.
             np.save(f"{self.args.ckpt_dir}/test_preds.npy", test_preds_arr)
             np.save(f"{self.args.ckpt_dir}/test_targets.npy", test_targets_arr)
+            if len(self.test_preds_rows) > 0:
+                preds_2d = np.concatenate(self.test_preds_rows, axis=0)
+                targets_2d = np.concatenate(self.test_targets_rows, axis=0)
+                np.save(f"{self.args.ckpt_dir}/test_preds_2d.npy", preds_2d)
+                np.save(f"{self.args.ckpt_dir}/test_targets_2d.npy", targets_2d)
+                self._save_selected_test_window_visuals(preds_2d, targets_2d)
+            self._save_val_rmse_over_epochs_plot()
             report = f"""=== RUL Prediction Report ===
             Evaluation Metrics:
             - RMSE: {rmse:.8f}
@@ -261,8 +291,8 @@ class Model(pl.LightningModule):
 
             if self.args.rul_target_mode_effective == "multi" and self.rul_label_shape is not None:
                 try:
-                    per_dim_rmse = np.sqrt(np.mean((np.array(self.test_preds).reshape(-1, *self.rul_label_shape) -
-                                                   np.array(self.test_targets).reshape(-1, *self.rul_label_shape)) ** 2, axis=0))
+                    per_dim_rmse = np.sqrt(np.mean((preds_2d.reshape(-1, *self.rul_label_shape) -
+                                                   targets_2d.reshape(-1, *self.rul_label_shape)) ** 2, axis=0))
                     report += "\nPer-target RMSE matrix (channels x horizon or original label layout):\n"
                     report += np.array2string(per_dim_rmse, precision=4)
                     report += "\n"
@@ -289,6 +319,8 @@ class Model(pl.LightningModule):
 
         self.test_preds = []
         self.test_targets = []
+        self.test_preds_rows = []
+        self.test_targets_rows = []
 
     def _prepare_rul_targets(self, y):
         y = y.float()
@@ -308,6 +340,123 @@ class Model(pl.LightningModule):
                 )
             return y2[:, idx:idx + 1]
         return y2
+
+    def _compute_per_variable_rmse(self, preds_2d, targets_2d):
+        if self.rul_label_shape is None or len(self.rul_label_shape) == 0:
+            return np.array([float(np.sqrt(np.mean((preds_2d - targets_2d) ** 2)))], dtype=np.float32)
+
+        preds_nd = preds_2d.reshape(-1, *self.rul_label_shape)
+        targets_nd = targets_2d.reshape(-1, *self.rul_label_shape)
+
+        if len(self.rul_label_shape) >= 2:
+            # First axis in label shape is treated as variable/channel axis.
+            rmse_by_var = []
+            for var_idx in range(self.rul_label_shape[0]):
+                p = preds_nd[:, var_idx, ...]
+                t = targets_nd[:, var_idx, ...]
+                rmse_by_var.append(float(np.sqrt(np.mean((p - t) ** 2))))
+            return np.array(rmse_by_var, dtype=np.float32)
+
+        rmse = np.sqrt(np.mean((preds_nd - targets_nd) ** 2, axis=0))
+        return rmse.reshape(-1).astype(np.float32)
+
+    def _save_selected_test_window_visuals(self, preds_2d, targets_2d):
+        if self.rul_label_shape is None and self.args.rul_target_mode_effective != "single":
+            return
+
+        if self.args.rul_target_mode_effective == "single":
+            preds_nd = preds_2d.reshape(-1, 1, 1)
+            targets_nd = targets_2d.reshape(-1, 1, 1)
+        else:
+            preds_nd = preds_2d.reshape(-1, *self.rul_label_shape)
+            targets_nd = targets_2d.reshape(-1, *self.rul_label_shape)
+
+        total_windows = preds_nd.shape[0]
+        if total_windows == 0:
+            return
+
+        # Sample 20 evenly spaced windows from first 100 windows (or less if unavailable).
+        sample_pool = min(100, total_windows)
+        n_select = min(20, sample_pool)
+        selected_idx = np.linspace(0, sample_pool - 1, num=n_select, dtype=int)
+
+        with open(f"{self.args.ckpt_dir}/selected_test_windows_indices.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["window_index"])
+            for idx in selected_idx:
+                writer.writerow([int(idx)])
+
+        if self.args.rul_target_mode_effective == "single":
+            num_vars = 1
+            horizon = 1
+            preds_view = preds_nd.reshape(total_windows, num_vars, horizon)
+            targets_view = targets_nd.reshape(total_windows, num_vars, horizon)
+        elif len(self.rul_label_shape) >= 2:
+            num_vars = self.rul_label_shape[0]
+            horizon = int(np.prod(self.rul_label_shape[1:]))
+            preds_view = preds_nd.reshape(total_windows, num_vars, horizon)
+            targets_view = targets_nd.reshape(total_windows, num_vars, horizon)
+        else:
+            num_vars = self.rul_label_shape[0]
+            horizon = 1
+            preds_view = preds_nd.reshape(total_windows, num_vars, horizon)
+            targets_view = targets_nd.reshape(total_windows, num_vars, horizon)
+
+        for var_idx in range(num_vars):
+            preds_sel = preds_view[selected_idx, var_idx, :]
+            targets_sel = targets_view[selected_idx, var_idx, :]
+
+            csv_path = f"{self.args.ckpt_dir}/test_selected_windows_var{var_idx}.csv"
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                header = ["window_index"]
+                for h in range(horizon):
+                    header += [f"actual_h{h}", f"pred_h{h}"]
+                writer.writerow(header)
+
+                for i, win_idx in enumerate(selected_idx):
+                    row = [int(win_idx)]
+                    for h in range(horizon):
+                        row += [float(targets_sel[i, h]), float(preds_sel[i, h])]
+                    writer.writerow(row)
+
+            fig, axes = plt.subplots(horizon, 1, figsize=(10, max(3, 2.5 * horizon)), sharex=True)
+            if horizon == 1:
+                axes = [axes]
+            x_ticks = np.arange(n_select)
+            for h in range(horizon):
+                axes[h].plot(x_ticks, targets_sel[:, h], marker='o', label='Actual')
+                axes[h].plot(x_ticks, preds_sel[:, h], marker='x', label='Predicted')
+                axes[h].set_ylabel(f"h{h}")
+                axes[h].grid(alpha=0.2)
+                axes[h].legend(loc='best')
+            axes[-1].set_xlabel("Selected window order (evenly spaced over first 100)")
+            fig.suptitle(f"Variable {var_idx}: Actual vs Predicted on selected test windows")
+            fig.tight_layout()
+            fig.savefig(f"{self.args.ckpt_dir}/test_selected_windows_var{var_idx}.png", bbox_inches="tight")
+            plt.close(fig)
+
+    def _save_val_rmse_over_epochs_plot(self):
+        if len(self.val_rmse_per_var_history) == 0:
+            return
+
+        rmse_hist = np.array(self.val_rmse_per_var_history, dtype=np.float32)  # [epochs, vars]
+        if rmse_hist.ndim == 1:
+            rmse_hist = rmse_hist[:, None]
+
+        epochs = np.arange(1, rmse_hist.shape[0] + 1)
+        plt.figure(figsize=(10, 6))
+        for var_idx in range(rmse_hist.shape[1]):
+            label = "target0" if (rmse_hist.shape[1] == 1) else f"var{var_idx}"
+            plt.plot(epochs, rmse_hist[:, var_idx], marker='o', label=label)
+        plt.xlabel("Epoch")
+        plt.ylabel("Validation RMSE")
+        plt.title("Validation RMSE vs Epoch per Target Variable")
+        plt.grid(alpha=0.2)
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.savefig(f"{self.args.ckpt_dir}/val_rmse_per_variable_over_epochs.png", bbox_inches="tight")
+        plt.close()
 
 
 # ==================== Callbacks ====================
