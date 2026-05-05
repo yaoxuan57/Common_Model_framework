@@ -56,6 +56,7 @@ class Model(pl.LightningModule):
 
         self.test_preds = []
         self.test_targets = []
+        self.rul_label_shape = None
 
     def forward(self, x):
         return self.model(x)
@@ -114,10 +115,18 @@ class Model(pl.LightningModule):
 
         elif self.args.task_type == "RUL":
             feats = self(x)
-            preds = self.model.predict(feats)
-            if preds.ndim > 1:
-                preds = preds.view(-1)
-            y = y.view(-1).float()
+            preds = self.model.predict(feats).float()
+            y = y.float()
+
+            # Normalize to [B, D] so scalar and multi-target regression share one path.
+            preds = preds.view(preds.size(0), -1) if preds.ndim > 1 else preds.unsqueeze(-1)
+            y = self._prepare_rul_targets(y)
+
+            if preds.size(1) != y.size(1):
+                raise ValueError(
+                    f"Prediction/target shape mismatch for RUL: preds={tuple(preds.shape)}, targets={tuple(y.shape)}"
+                )
+
             loss = self.loss_fn(preds, y)
 
         # ---- metrics/logging ----
@@ -145,8 +154,8 @@ class Model(pl.LightningModule):
 
             else:
                 self.test_rmse.update(preds, y)
-                self.test_preds.extend(preds.detach().float().cpu().numpy())
-                self.test_targets.extend(y.detach().float().cpu().numpy())
+                self.test_preds.extend(preds.detach().cpu().reshape(-1).numpy())
+                self.test_targets.extend(y.detach().cpu().reshape(-1).numpy())
                 score = scoring_function_v2(np.array(self.test_preds), np.array(self.test_targets))
                 self.log("test_score", score)
 
@@ -206,56 +215,99 @@ class Model(pl.LightningModule):
             self.log("test_rmse", rmse)
             self.test_rmse.reset()
 
-            # Calculate final score
-            score = scoring_function_v2(np.array(self.test_preds), np.array(self.test_targets))
+            test_preds_arr = np.array(self.test_preds, dtype=np.float32)
+            test_targets_arr = np.array(self.test_targets, dtype=np.float32)
+            mae = float(np.mean(np.abs(test_preds_arr - test_targets_arr)))
 
-            # print(self.test_predss)
-            # print(self.test_targets)
-            # print(score)
+            # Scoring function is only defined for scalar RUL.
+            score = None
+            if self.args.rul_target_mode_effective == "single":
+                score = scoring_function_v2(test_preds_arr, test_targets_arr)
+                self.log("test_score", score)
+            self.log("test_mae", mae)
 
-            self.log("test_score", score)
-
-            # Save predictions and targets
-            np.save(f"{self.args.ckpt_dir}/test_preds.npy", np.array(self.test_preds))
-            np.save(f"{self.args.ckpt_dir}/test_targets.npy", np.array(self.test_targets))
+            # Save flattened predictions and targets.
+            np.save(f"{self.args.ckpt_dir}/test_preds.npy", test_preds_arr)
+            np.save(f"{self.args.ckpt_dir}/test_targets.npy", test_targets_arr)
             report = f"""=== RUL Prediction Report ===
             Evaluation Metrics:
             - RMSE: {rmse:.8f}
-            - Score: {score:.8f}
+            - MAE: {mae:.8f}
+            - Target Mode: {self.args.rul_target_mode_effective}
+            - Output Dim: {self.args.num_classes}
+            """
+            if score is not None:
+                report += f"- Score: {score:.8f}\n"
+            else:
+                report += "- Score: N/A (multi-target mode)\n"
+
+            report += f"""
 
             Prediction Statistics:
-            - Min True RUL: {np.min(self.test_targets):.2f}
-            - Max True RUL: {np.max(self.test_targets):.2f}
-            - Mean True RUL: {np.mean(self.test_targets):.2f}
-            - Std True RUL: {np.std(self.test_targets):.2f}
+            - Min True RUL: {np.min(test_targets_arr):.2f}
+            - Max True RUL: {np.max(test_targets_arr):.2f}
+            - Mean True RUL: {np.mean(test_targets_arr):.2f}
+            - Std True RUL: {np.std(test_targets_arr):.2f}
 
-            - Min Predicted RUL: {np.min(self.test_preds):.2f}
-            - Max Predicted RUL: {np.max(self.test_preds):.2f}
-            - Mean Predicted RUL: {np.mean(self.test_preds):.2f}
-            - Std Predicted RUL: {np.std(self.test_preds):.2f}
+            - Min Predicted RUL: {np.min(test_preds_arr):.2f}
+            - Max Predicted RUL: {np.max(test_preds_arr):.2f}
+            - Mean Predicted RUL: {np.mean(test_preds_arr):.2f}
+            - Std Predicted RUL: {np.std(test_preds_arr):.2f}
 
             First 10 predictions (True, Predicted):
             """
-            for i in range(min(10, len(self.test_targets))):
-                report += f"{self.test_targets[i]:.2f}, {self.test_preds[i]:.2f}\n"
+            for i in range(min(10, len(test_targets_arr))):
+                report += f"{test_targets_arr[i]:.4f}, {test_preds_arr[i]:.4f}\n"
+
+            if self.args.rul_target_mode_effective == "multi" and self.rul_label_shape is not None:
+                try:
+                    per_dim_rmse = np.sqrt(np.mean((np.array(self.test_preds).reshape(-1, *self.rul_label_shape) -
+                                                   np.array(self.test_targets).reshape(-1, *self.rul_label_shape)) ** 2, axis=0))
+                    report += "\nPer-target RMSE matrix (channels x horizon or original label layout):\n"
+                    report += np.array2string(per_dim_rmse, precision=4)
+                    report += "\n"
+                except Exception:
+                    pass
 
             print(report)
             with open(f"{self.args.ckpt_dir}/rul_report.txt", "w") as f:
                 f.write(report)
             # Plot predictions vs targets
             plt.figure(figsize=(10, 6))
-            plt.scatter(self.test_targets, self.test_preds, alpha=0.5)
-            plt.plot([min(self.test_targets), max(self.test_targets)],
-                     [min(self.test_targets), max(self.test_targets)], 'r--')
+            plt.scatter(test_targets_arr, test_preds_arr, alpha=0.5)
+            plt.plot([min(test_targets_arr), max(test_targets_arr)],
+                     [min(test_targets_arr), max(test_targets_arr)], 'r--')
             plt.xlabel('True RUL')
             plt.ylabel('Predicted RUL')
-            plt.title(f'RUL Prediction\nRMSE: {rmse:.2f}, Score: {score:.2f}')
+            title = f'RUL Prediction\nRMSE: {rmse:.2f}, MAE: {mae:.2f}'
+            if score is not None:
+                title += f', Score: {score:.2f}'
+            plt.title(title)
             plt.tight_layout()
             plt.savefig(f"{self.args.ckpt_dir}/rul_prediction.png", bbox_inches="tight")
             plt.close()
 
         self.test_preds = []
         self.test_targets = []
+
+    def _prepare_rul_targets(self, y):
+        y = y.float()
+        if y.ndim == 1:
+            y2 = y.unsqueeze(-1)
+            self.rul_label_shape = (1,)
+            return y2
+
+        y2 = y.view(y.size(0), -1)
+        self.rul_label_shape = tuple(y.shape[1:])
+
+        if self.args.rul_target_mode_effective == "single":
+            idx = self.args.rul_single_target_index
+            if idx < 0 or idx >= y2.size(1):
+                raise ValueError(
+                    f"rul_single_target_index={idx} out of range for labels flattened dim {y2.size(1)}"
+                )
+            return y2[:, idx:idx + 1]
+        return y2
 
 
 # ==================== Callbacks ====================
@@ -326,7 +378,22 @@ def main(args):
         args.num_classes = len(np.unique(train_loader.dataset.y_data))
         args.class_names = [str(i) for i in range(args.num_classes)]
     else:
-        args.num_classes = 1
+        y_shape = tuple(train_loader.dataset.y_data.shape[1:])
+        if len(y_shape) == 0:
+            total_target_dim = 1
+        else:
+            total_target_dim = int(np.prod(y_shape))
+
+        if args.rul_target_mode == "auto":
+            args.rul_target_mode_effective = "single" if total_target_dim == 1 else "multi"
+        else:
+            args.rul_target_mode_effective = args.rul_target_mode
+
+        args.num_classes = 1 if args.rul_target_mode_effective == "single" else total_target_dim
+        print(f"RUL labels shape per sample: {y_shape}, flattened dim={total_target_dim}")
+        print(f"RUL target mode: {args.rul_target_mode_effective}")
+        if args.rul_target_mode_effective == "single":
+            print(f"RUL single target index (flattened): {args.rul_single_target_index}")
     args.seq_len = train_loader.dataset.x_data.shape[-1]
     args.num_channels = train_loader.dataset.x_data.shape[1]
     args.tl_length = len(train_loader)
@@ -470,6 +537,19 @@ if __name__ == "__main__":
     parser.add_argument('--wt_decay', type=float, default=1e-4)
     parser.add_argument('--random_seed', type=int, default=42)
     parser.add_argument('--task_type',type=str,default='FD',choices=['FD', 'RUL'])
+    parser.add_argument(
+        '--rul_target_mode',
+        type=str,
+        default='auto',
+        choices=['auto', 'single', 'multi'],
+        help='RUL label handling: auto(infer), single(one target), multi(all targets, flattened)'
+    )
+    parser.add_argument(
+        '--rul_single_target_index',
+        type=int,
+        default=0,
+        help='Flattened index to use when --rul_target_mode single and labels have multiple dimensions'
+    )
     args = parser.parse_args()
     apply_model_config(args)
     main(args)
