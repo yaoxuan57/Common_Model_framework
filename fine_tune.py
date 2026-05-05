@@ -354,10 +354,12 @@ def main(args):
 
     model = Model(args)
 
+    load_map = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
+
     # Optional load pretrained weights
     if args.load_from_pretrained and args.pretrained_model_type != 'mae':
         path = os.path.join(args.pretrained_model_dir, f"pretrain-epoch={args.pretraining_epoch_id}.ckpt")
-        checkpoint_data = torch.load(path, map_location='cuda', weights_only=False)
+        checkpoint_data = torch.load(path, map_location=load_map, weights_only=False)
 
 
         # Filter and count matching keys with the same shape
@@ -376,7 +378,7 @@ def main(args):
 
     elif args.load_from_pretrained:  #
         path = os.path.join(args.pretrained_model_dir, f"pretrain-epoch={args.pretraining_epoch_id}.ckpt")
-        checkpoint_data = torch.load(path, map_location='cuda', weights_only=False)
+        checkpoint_data = torch.load(path, map_location=load_map, weights_only=False)
         checkpoint_state = checkpoint_data['state_dict']
         model_state = model.state_dict()
 
@@ -398,13 +400,18 @@ def main(args):
         print(f"Matched weights: {len(remapped_weights)}/{len(model_state)} model parameters matched "
               f"(from {len(checkpoint_state)} pretrained parameters)")
 
+    if torch.cuda.is_available():
+        accelerator, devices, precision = "gpu", [args.gpu_id], "bf16-mixed"
+    else:
+        accelerator, devices, precision = "cpu", 1, "32-true"
+
     trainer = pl.Trainer(
         default_root_dir=ckpt_dir,
         max_epochs=args.num_epochs,
         callbacks=[checkpoint, early_stop, tracker, TQDMProgressBar(refresh_rate=500)],
-        accelerator="auto",
-        precision='bf16-mixed',
-        devices=[args.gpu_id],
+        accelerator=accelerator,
+        precision=precision,
+        devices=devices,
         num_sanity_val_steps=0,
     )
 
