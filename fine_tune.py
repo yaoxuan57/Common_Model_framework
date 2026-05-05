@@ -3,6 +3,7 @@ import argparse
 import datetime
 import math
 import csv
+from pathlib import Path
 
 import torch
 import pytorch_lightning as pl
@@ -420,21 +421,23 @@ class Model(pl.LightningModule):
                         row += [float(targets_sel[i, h]), float(preds_sel[i, h])]
                     writer.writerow(row)
 
-            fig, axes = plt.subplots(horizon, 1, figsize=(10, max(3, 2.5 * horizon)), sharex=True)
-            if horizon == 1:
-                axes = [axes]
-            x_ticks = np.arange(n_select)
-            for h in range(horizon):
-                axes[h].plot(x_ticks, targets_sel[:, h], marker='o', label='Actual')
-                axes[h].plot(x_ticks, preds_sel[:, h], marker='x', label='Predicted')
-                axes[h].set_ylabel(f"h{h}")
-                axes[h].grid(alpha=0.2)
-                axes[h].legend(loc='best')
-            axes[-1].set_xlabel("Selected window order (evenly spaced over first 100)")
-            fig.suptitle(f"Variable {var_idx}: Actual vs Predicted on selected test windows")
-            fig.tight_layout()
-            fig.savefig(f"{self.args.ckpt_dir}/test_selected_windows_var{var_idx}.png", bbox_inches="tight")
-            plt.close(fig)
+            # Save 20 PNGs per variable: one plot per selected window.
+            var_dir = Path(self.args.ckpt_dir) / f"test_selected_windows_var{var_idx}"
+            var_dir.mkdir(parents=True, exist_ok=True)
+            horizon_x = np.arange(horizon)
+
+            for i, win_idx in enumerate(selected_idx):
+                plt.figure(figsize=(8, 4))
+                plt.plot(horizon_x, targets_sel[i], marker='o', label='Actual')
+                plt.plot(horizon_x, preds_sel[i], marker='x', label='Predicted')
+                plt.xlabel("Horizon step")
+                plt.ylabel("Value")
+                plt.title(f"Variable {var_idx} - Window {int(win_idx)}")
+                plt.grid(alpha=0.25)
+                plt.legend(loc="best")
+                plt.tight_layout()
+                plt.savefig(var_dir / f"window_{int(win_idx)}.png", bbox_inches="tight")
+                plt.close()
 
     def _save_val_rmse_over_epochs_plot(self):
         if len(self.val_rmse_per_var_history) == 0:
@@ -711,3 +714,9 @@ if __name__ == "__main__":
 
 # Time Series Regression
 # python fine_tune.py --task_type RUL --data_path C:\Users\ngyx\Desktop\Common_Model_framework\time_series_dataset --data_id FEMTO_Regression/splits --data_percentage 1 --model_id FEMTO_FT --model_type tiny --pretrained_model_dir pretrained_models/Tiny --pretraining_epoch_id 1 --batch_size 16 --num_epochs 5 --lr 3e-4 --gpu_id 0
+
+# Time series forecasting multi-target
+# python fine_tune.py --task_type RUL --data_path time_series_dataset --data_id sanwa_forecasting/splits --data_percentage 1 --model_id sanwa_multi --model_type tiny --pretrained_model_dir pretrained_models/Tiny --pretraining_epoch_id 1 --batch_size 16 --num_epochs 1 --lr 3e-4 --gpu_id 0 --rul_target_mode multi
+
+# time series forecasting single-target
+# python fine_tune.py --task_type RUL --data_path time_series_dataset --data_id sanwa_forecasting/splits --data_percentage 1 --model_id sanwa_single --model_type tiny --pretrained_model_dir pretrained_models/Tiny --pretraining_epoch_id 1 --batch_size 16 --num_epochs 1 --lr 3e-4 --gpu_id 0 --rul_target_mode single --rul_single_target_index 0
